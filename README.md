@@ -94,6 +94,23 @@ config.buildinfo 微调），提交后打 tag `v25.12.3`（或等定时任务自
 - 构建在 **self-hosted runner**（低配 Linux 机器）上执行；`config/<版本>.config` 不存在时
   直接报错，保证"一版本一配置"的纪律。
 
+### 自托管 Runner 搭建 / 重建
+
+GitHub 云机跑不了本构建（14G 磁盘、6 小时上限），构建跑在自托管 runner 上。新机器上重建：
+
+```sh
+git clone <本仓库地址> && cd <仓库目录>
+RUNNER_TOKEN=<token> PROXY_URL=http://<代理IP>:9001 ./scripts/setup-runner.sh
+```
+
+- token：fine-grained token（需本仓库 Administration: read+write），或 Settings → Actions
+  → Runners 页面显示的一次性 registration token
+- 硬件：任意 x86_64 Linux，2 核约 8~10 小时/次（4 核减半），内存 ≥16G，磁盘空闲 ≥60G
+- 机器重启后只需 `./scripts/setup-runner.sh --start`
+- 不再需要时：`RUNNER_TOKEN=<token> ./scripts/setup-runner.sh --uninstall`（注销后可放心删机）
+- runner 是仓库级的：一台机器可同时承载多个仓库的 runner（每仓库独立实例
+  `~/.runners/<仓库名>`，互不干扰）
+
 ## 许可证
 
 GPL-2.0-only，与 ImmortalWrt / OpenWrt 一致（见 `LICENSE`）。
