@@ -8,7 +8,8 @@
 #
 # 说明:
 #   - REPO 默认取本仓库 git 目录名（= GitHub 仓库名），OWNER 默认 dontshootitsme
-#   - Release 若已存在则更新说明并重传附件（附件先删后传，避免重复）
+#   - Release 若已存在则整体重建（删除后重建，保证附件干净无残留）
+#   - 附件上传走官方 gh CLI（部分网络环境下 curl 直传资产接口不稳定）
 # ============================================================================
 set -e
 
@@ -22,9 +23,10 @@ TOKEN="${GITHUB_TOKEN:?需要 GITHUB_TOKEN（fine-grained token，需 Contents: 
 [ -d "$SRC" ] || { echo "找不到产物目录: $SRC" >&2; exit 1; }
 cd "$SRC"
 
-# 3 个 ubootmod 镜像
-FILES=$(ls *ubootmod* 2>/dev/null | grep -E 'initramfs-kernel|squashfs-factory|squashfs-sysupgrade$' || true)
+# 3 个 ubootmod 镜像（initramfs / factory / sysupgrade）
+FILES=$(ls *ubootmod* 2>/dev/null | grep -E 'initramfs-kernel|squashfs-factory|squashfs-sysupgrade' || true)
 [ -n "$FILES" ] || { echo "产物目录里找不到 ubootmod 三件套: $SRC" >&2; exit 1; }
+echo "==> 将发布: $(printf '%s\n' $FILES | tr '\n' ' ')"
 
 sha256sum $FILES > sha256sums.txt
 
@@ -64,44 +66,42 @@ body = open(sys.argv[1]).read()
 print(json.dumps({"tag_name": sys.argv[2], "name": "ImmortalWrt " + sys.argv[3] + " (ubootmod)", "body": body}))
 ' "$NOTE_FILE" "$TAG" "$VERSION")
 
-# 查找已存在的 release
-REL=$(curl -sS --max-time 30 -H "$H1" -H "$H2" "$API/releases/tags/$TAG")
-RID=$(printf '%s' "$REL" | python3 -c 'import json,sys
+# 已存在的 release 整体删除（含残留附件），随后重建
+OLD=$(curl -sS --max-time 30 -H "$H1" -H "$H2" "$API/releases/tags/$TAG")
+OLD_ID=$(printf '%s' "$OLD" | python3 -c 'import json,sys
 try:
     d=json.load(sys.stdin); print(d.get("id",""))
 except Exception:
     print("")')
+if [ -n "$OLD_ID" ]; then
+  echo "==> 删除已存在的 release $OLD_ID（重建以保证附件干净）"
+  curl -sS --max-time 30 -X DELETE -H "$H1" -H "$H2" "$API/releases/$OLD_ID" > /dev/null || true
+  sleep 2
+fi
 
-if [ -n "$RID" ]; then
-  echo "==> 更新已存在的 release $RID"
-  printf '%s' "$REL_JSON" > /tmp/rel_update.json
-  curl -sS --max-time 30 -X PATCH -H "$H1" -H "$H2" -d @/tmp/rel_update.json "$API/releases/$RID" > /dev/null
-  # 删除旧附件
-  printf '%s' "$REL" | python3 -c 'import json,sys
-for a in json.load(sys.stdin).get("assets",[]):
-    del_url=a.get("_links",{}).get("delete",{}).get("href","")
-    if del_url: print(del_url)' | while read -r u; do
-    curl -sS --max-time 30 -X DELETE -H "$H1" -H "$H2" "$u" > /dev/null || true
-  done
-else
-  echo "==> 创建 release $TAG"
-  printf '%s' "$REL_JSON" > /tmp/rel_create.json
-  CREATED=$(curl -sS --max-time 30 -X POST -H "$H1" -H "$H2" -d @/tmp/rel_create.json "$API/releases")
-  RID=$(printf '%s' "$CREATED" | python3 -c 'import json,sys
+echo "==> 创建 release $TAG"
+printf '%s' "$REL_JSON" > /tmp/rel_create.json
+CREATED=$(curl -sS --max-time 30 -X POST -H "$H1" -H "$H2" -d @/tmp/rel_create.json "$API/releases")
+RID=$(printf '%s' "$CREATED" | python3 -c 'import json,sys
 try:
     print(json.load(sys.stdin).get("id",""))
 except Exception:
     print("")')
+[ -n "$RID" ] || { echo "创建 release 失败: $(printf '%s' "$CREATED" | head -c 300)" >&2; exit 1; }
+
+# 上传附件：官方 gh CLI（缺失时自动下载）
+GH=$(command -v gh 2>/dev/null || true)
+if [ -z "$GH" ] && [ -x /tmp/gh ]; then GH=/tmp/gh; fi
+if [ -z "$GH" ]; then
+  echo "==> 安装 gh CLI"
+  curl -sSL --max-time 300 -o /tmp/gh.tgz \
+    "https://github.com/cli/cli/releases/download/v2.63.2/gh_2.63.2_linux_amd64.tar.gz"
+  tar xzf /tmp/gh.tgz -C /tmp
+  GH=/tmp/gh_2.63.2_linux_amd64/bin/gh
+  chmod +x "$GH"
 fi
-
-[ -n "$RID" ] || { echo "创建/更新 release 失败" >&2; exit 1; }
-
-for f in $FILES sha256sums.txt; do
-  echo "==> 上传 $f"
-  curl -sS --max-time 600 -X POST -H "$H1" \
-    -H "Content-Type: application/octet-stream" \
-    --data-binary "@$f" \
-    "$API/releases/$RID/assets?name=$f" > /dev/null
-done
+echo "==> 上传附件（gh release upload）"
+GH_TOKEN="$TOKEN" "$GH" release upload "$TAG" $FILES sha256sums.txt \
+  --repo "$OWNER/$REPO" --clobber
 
 echo "==> 完成: https://github.com/$OWNER/$REPO/releases/tag/$TAG"
