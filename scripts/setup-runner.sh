@@ -25,6 +25,8 @@
 #   - runner 是仓库级的：一台机器可同时承载多个仓库的 runner，
 #     每个仓库独立实例目录 ~/.runners/<仓库名>，互不干扰。
 #   - 实例目录里保留 runner 二进制，机器上已有其他仓库的 tarball 缓存会自动复用。
+#   - 注销走 REST API（DELETE /actions/runners/{id}）：官方 config.sh remove
+#     在 fine-grained token 下会 404，且不支持 --name 参数，故不用它。
 # ============================================================================
 set -e
 
@@ -41,16 +43,39 @@ fi
 OWNER="${OWNER:-dontshootitsme}"
 DIR="$HOME/.runners/$REPO"
 
+# --- 停掉本实例的进程（Listener 按路径匹配；run.sh 包装进程按 /proc cwd 定位）---
+stop_instance() {
+  pkill -f "$DIR/bin/Runner.Listener" 2>/dev/null || true
+  for d in /proc/[0-9]*/cwd; do
+    if [ "$(readlink "$d" 2>/dev/null)" = "$DIR" ]; then
+      kill "$(basename "$(dirname "$d")")" 2>/dev/null || true
+    fi
+  done
+}
+
 # --- 注销 ---
 if [ "$MODE" = "--uninstall" ] || [ "$MODE" = "uninstall" ]; then
   [ -d "$DIR" ] || { echo "本仓库没有 runner 实例（$DIR），无需注销"; exit 0; }
-  cd "$DIR"
+  stop_instance
+  sleep 2
   if [ -n "${RUNNER_TOKEN:-}" ]; then
-    ./config.sh remove --name "$NAME" --token "$RUNNER_TOKEN" || true
+    export RUNNER_NAME="$NAME"
+    for id in $(curl -sSL --max-time 30 \
+        -H "Authorization: Bearer $RUNNER_TOKEN" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$REPO/actions/runners" \
+        | python3 -c 'import json,os,sys
+try: rs=json.load(sys.stdin).get("runners",[])
+except Exception: rs=[]
+n=os.environ.get("RUNNER_NAME","")
+[print(r["id"]) for r in rs if (not n or r.get("name")==n)]' 2>/dev/null); do
+      code=$(curl -sSL --max-time 30 -o /dev/null -w '%{http_code}' -X DELETE \
+        -H "Authorization: Bearer $RUNNER_TOKEN" -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$OWNER/$REPO/actions/runners/$id")
+      echo "  已注销 runner id=$id (HTTP $code)"
+    done
   else
-    echo "未提供 RUNNER_TOKEN：只停进程，不向 GitHub 注销"
+    echo "未提供 RUNNER_TOKEN：只停了本地进程，未向 GitHub 注销"
   fi
-  pkill -f "$DIR/run.sh" 2>/dev/null || true
   echo "==> $REPO 的 runner 已注销（实例目录 $DIR 保留，可手动删除）"
   exit 0
 fi
@@ -59,7 +84,7 @@ fi
 if [ "$MODE" = "--start" ] || [ "$MODE" = "start" ]; then
   [ -d "$DIR" ] || { echo "找不到实例: $DIR（请先跑注册流程）" >&2; exit 1; }
   cd "$DIR"
-  pkill -f "$DIR/run.sh" 2>/dev/null || true
+  stop_instance
   sleep 2
   nohup ./run.sh > "$DIR/runner.log" 2>&1 &
   sleep 6
@@ -120,7 +145,7 @@ esac
 echo "==> 注册 $OWNER/$REPO 的 runner（名称: $NAME）"
 ./config.sh --url "https://github.com/$OWNER/$REPO" --name "$NAME" --token "$RT" --replace --no-prompt
 
-pkill -f "$DIR/run.sh" 2>/dev/null || true
+stop_instance
 sleep 2
 nohup ./run.sh > "$DIR/runner.log" 2>&1 &
 sleep 8
